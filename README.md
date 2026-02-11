@@ -144,6 +144,22 @@ Use `config.yaml.example` as the template.
 - `state.waiting_timeout_hours`
   - auto-clean stale WAITING sessions/messages
 
+### Cookies (`cookies.txt`)
+
+Set `recording.cookies_file` in `config.yaml` (example: `./cookies.txt`).
+
+- Twitch-only setup:
+  - use Twitch cookies.
+- YouTube-only setup:
+  - use YouTube cookies.
+- `both` / `cross` setup:
+  - you can use one combined `cookies.txt` containing both Twitch and YouTube cookies.
+
+Notes:
+- file format should be Netscape cookies format (standard for `yt-dlp`);
+- if cookies expire, re-export and replace `cookies.txt`;
+- set `recording.cookies_file` to empty (`""`) to disable cookies.
+
 ### Upload Design Note
 
 If `upload_speed_limit_mbps > 0`, FastTelethonhelper is disabled automatically.

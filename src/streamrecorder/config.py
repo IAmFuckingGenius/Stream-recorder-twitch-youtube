@@ -327,7 +327,7 @@ def create_example_config(path: str = "config.example.yaml") -> None:
 telegram:
   api_id: YOUR_API_ID  # Get from https://my.telegram.org
   api_hash: YOUR_API_HASH
-  channel_id: 2756205389  # Channel ID to upload recordings
+  channel_id: -1001234567890  # Channel ID to upload recordings
   discussion_group_id: -1001234567890  # Optional, for comments/discussion
   session_name: stream_recorder
   use_fast_upload_helper: true  # Use FastTelethonhelper when available
