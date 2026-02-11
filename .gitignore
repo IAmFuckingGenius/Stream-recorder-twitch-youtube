@@ -1,0 +1,121 @@
+# ---------------------------
+# Python caches and bytecode
+# ---------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------------------------
+# Tool caches and reports
+# ---------------------------
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+.nox/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------
+# Build / packaging artifacts
+# ---------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# ---------------------------
+# Virtual environments
+# ---------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------
+# IDE / editor / OS junk
+# ---------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ---------------------------
+# Local secrets and machine config
+# ---------------------------
+config.yaml
+cookies.txt
+.env
+.env.*
+!.env.example
+.python-version
+*.session
+*.session-journal
+
+# ---------------------------
+# Runtime data (generated)
+# ---------------------------
+logs/
+temp/
+recordings/
+data/state.json
+log_file.txt
+log_last.txt
+default_*.json
+
+# ---------------------------
+# Download / media temp files
+# ---------------------------
+*.part
+*.ytdl
+*.tmp
+
+# ---------------------------
+# Local artifacts
+# ---------------------------
+artifacts/
+*.prof
+newrex_*.zip
+
+# ---------------------------
+# Extra local clutter
+# ---------------------------
+*.log
+*.bak
+*.old
+*.orig
+*.pid
+
+# Archives / dumps
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# Large media leftovers
+*.mp4
+*.mkv
+*.ts
+*.webm
+*.m4a
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------------------------
+# Optional non-core folders
+# ---------------------------
+scripts/
+tests/
+docs/

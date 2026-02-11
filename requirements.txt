@@ -1,0 +1,18 @@
+# Twitch Stream Recorder v2 Dependencies
+
+# Telegram client
+telethon>=1.36.0
+# Optional Telethon crypto acceleration (recommended)
+cryptg>=0.5.0
+
+# Configuration
+pyyaml>=6.0
+
+# Async file operations
+aiofiles>=23.0
+
+# Async HTTP client (for Twitch API)
+aiohttp>=3.9.0
+
+# yt-dlp (for recording streams)
+yt-dlp>=2024.0

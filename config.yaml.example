@@ -1,0 +1,73 @@
+# Stream Recorder Configuration Example
+# Copy this file to config.yaml and fill your real values.
+
+# Platform: twitch | youtube | both | cross
+# cross = monitor YouTube and attach Twitch continuation when stream switches platform
+platform: twitch
+
+telegram:
+  api_id: 12345678                    # Get from https://my.telegram.org
+  api_hash: "0123456789abcdef0123456789abcdef"
+  channel_id: -1001234567890          # Main upload channel
+  backup_channel_id: null             # Optional backup channel for forwards
+  discussion_group_id: null           # Optional explicit discussion group fallback
+  session_name: stream_recorder
+  use_fast_upload_helper: true        # Use FastTelethonhelper if installed
+  upload_parallelism: 1               # Parallel file uploads inside one album batch (1..10 reasonable)
+  upload_speed_limit_mbps: 0          # 0 = unlimited; cap is GLOBAL and shared across parallel uploads
+
+twitch:
+  client_id: "your_twitch_client_id"
+  client_secret: "your_twitch_client_secret"
+  oauth_token: ""                     # Optional
+  channels:
+    - examplechannel
+  check_interval: 2                   # Seconds between API checks
+  offline_grace_period: 200           # Wait before marking stream offline (handles short drops)
+  cross_check_delay: 15               # In cross mode: wait before checking Twitch after YT end
+
+youtube:
+  channels:
+    - "@examplechannel"
+  check_interval: 30
+
+recording:
+  output_dir: ./recordings
+  temp_dir: ./temp
+  format: b                           # 'b' (best) without yt-dlp deprecation warning
+  retries: 30                         # yt-dlp retries for restartable errors
+  fragment_retries: 10                # retries for HLS/DASH fragments
+  live_from_start: true               # try to capture from stream start if supported
+  cookies_file: "./cookies.txt"       # Set empty "" to disable
+  move_atom_to_front: true            # optimize MP4 playback start (moov atom relocation)
+  use_mpegts: true                    # safer for long live captures; converted later when needed
+  phantom_filter:
+    enabled: true                     # drop likely duplicate "tail phantom" segments
+    min_duration_sec: 60              # candidate shorter than this is suspicious
+    min_size_mb: 50                   # candidate smaller than this is suspicious
+    duplicate_hash_check: true        # compare candidate head vs previous segment tail
+    duplicate_hash_mb: 8              # compared window size for hash check
+    check_twitch_api: true            # skip only if Twitch API confirms offline
+    only_on_continuation: true        # apply filter only on 2nd+ segment in one session
+
+splitting:
+  default_size_gb: 1.8
+  premium_size_gb: 3.8
+
+compression:
+  enabled: false
+  default_target_size_mb: 1900
+  premium_target_size_mb: 3800
+  audio_bitrate_kbps: 128
+  two_pass: true
+
+logging:
+  level: INFO                         # DEBUG | INFO | WARNING | ERROR
+  file: ./logs/recorder.log
+  max_size_mb: 50
+  backup_count: 5
+  ytdlp_log_noise: false              # include noisy yt-dlp connection/progress lines
+
+state:
+  state_file: ./data/state.json
+  waiting_timeout_hours: 6            # auto-clean stale WAITING state/messages after timeout
