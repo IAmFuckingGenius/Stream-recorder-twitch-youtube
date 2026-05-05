@@ -119,3 +119,5 @@ newrex_*.zip
 scripts/
 tests/
 docs/
+
+.codex
