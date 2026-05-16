@@ -51,7 +51,8 @@ class YouTubeMonitor:
     def __init__(
         self,
         channels: List[str],
-        check_interval: int = 30
+        check_interval: int = 30,
+        cookies_file: str = ""
     ):
         """
         Initialize YouTube monitor.
@@ -59,9 +60,11 @@ class YouTubeMonitor:
         Args:
             channels: List of channel handles (@name) or IDs (UCxxx).
             check_interval: Seconds between checks.
+            cookies_file: Optional Netscape cookies file for yt-dlp checks.
         """
         self.channels = channels
         self.check_interval = check_interval
+        self.cookies_file = cookies_file
         self._logger = get_logger('youtube_monitor')
 
         # Track channel states
@@ -78,10 +81,27 @@ class YouTubeMonitor:
             'ignoreerrors': False,
             'logger': self._SilentLogger(),  # Suppress all yt-dlp stderr output
         }
+        if self.cookies_file:
+            self._ydl_opts['cookiefile'] = self.cookies_file
 
         # Initialize states
         for channel in channels:
             self._channel_states[channel] = StreamStatus.UNKNOWN
+
+    def update_channels(self, channels: List[str]) -> None:
+        """Replace monitored channel list while keeping useful state."""
+        new_set = set(channels)
+        old_set = set(self.channels)
+
+        for channel in new_set - old_set:
+            self._channel_states[channel] = StreamStatus.UNKNOWN
+
+        for channel in old_set - new_set:
+            self._channel_states.pop(channel, None)
+            self._channel_info.pop(channel, None)
+
+        self.channels = list(channels)
+        self._logger.info(f"YouTube monitor channels updated: {len(self.channels)}")
 
     def _get_live_url(self, channel: str) -> str:
         """Get the live stream URL for a channel."""
@@ -194,6 +214,9 @@ class YouTubeMonitor:
     async def _check_all_channels(self) -> List[MonitorEvent]:
         """Check all channels and return events."""
         events = []
+
+        if not self.channels:
+            return events
 
         for channel in self.channels:
             logger = get_channel_logger(channel)

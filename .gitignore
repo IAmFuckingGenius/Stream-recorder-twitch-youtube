@@ -52,12 +52,15 @@ Thumbs.db
 # ---------------------------
 config.yaml
 cookies.txt
+*cookies*.txt
 .env
 .env.*
 !.env.example
 .python-version
 *.session
 *.session-journal
+*.session-shm
+*.session-wal
 
 # ---------------------------
 # Runtime data (generated)
@@ -65,6 +68,7 @@ cookies.txt
 logs/
 temp/
 recordings/
+data/
 data/state.json
 log_file.txt
 log_last.txt
@@ -112,12 +116,28 @@ newrex_*.zip
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local upload/speed-test artifacts
+test_*.dat
+sitecustomize.py
 
 # ---------------------------
 # Optional non-core folders
 # ---------------------------
 scripts/
-tests/
+tests/*
+!tests/__init__.py
+!tests/conftest.py
+!tests/unit/
+!tests/unit/__init__.py
+!tests/unit/*.py
 docs/
 
 .codex
+STATUS.md

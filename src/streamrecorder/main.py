@@ -23,10 +23,15 @@ from .twitch_api import TwitchAPI
 from .stream_monitor import StreamEvent, StreamInfo, MonitorEvent
 from .platform_monitor import PlatformMonitor
 from .state_manager import StateManager, StreamState, StreamStatus
+from .state_manager import source_id_for_channel
 from .recorder import StreamRecorder, RecordingResult, RecordingStatus
 from .splitter import FileSplitter
 from .uploader import TelegramUploader, UploadResult, BatchUploadResult
 from .compressor import VideoCompressor
+from .job_manager import JobManager, TargetUploadScheduler
+from .runtime_config import RuntimeConfigManager
+from .runtime_config import SourceChannel, TargetProfile
+from .telegram_controller import TelegramController
 
 
 # Status icons for Telegram messages
@@ -109,6 +114,17 @@ class StreamRecorderApp:
             state_file=config.state.state_file
         )
 
+        self.runtime_config = RuntimeConfigManager(config.control.runtime_config_file)
+        self.telegram_controller: Optional[TelegramController] = None
+        self.jobs = JobManager({
+            "recording": config.jobs.recording_concurrency,
+            "processing": config.jobs.processing_concurrency,
+            "upload": config.jobs.upload_concurrency,
+            "compression": config.jobs.compression_concurrency,
+            "control": config.jobs.control_concurrency,
+        })
+        self.upload_scheduler = TargetUploadScheduler()
+
         # Runtime state
         self._shutdown_event = asyncio.Event()
         self._shutting_down = False  # Flag to indicate graceful shutdown
@@ -119,10 +135,12 @@ class StreamRecorderApp:
         self._recovery_tasks: Dict[str, asyncio.Task] = {}
         # Per-channel processing guard to avoid state corruption on new stream start.
         self._processing_channels: set[str] = set()
+        self._processing_tasks: Dict[str, asyncio.Task] = {}
         # If stream started while channel processing was busy, re-check after processing completes.
         self._pending_live_recheck: set[str] = set()
         # Cross mode dedup: per YT session key -> Twitch task
         self._cross_twitch_tasks: Dict[str, asyncio.Task] = {}
+        self._uptime_started_at = datetime.now()
 
     async def start(self) -> None:
         """Start the application."""
@@ -130,6 +148,8 @@ class StreamRecorderApp:
 
         # Load persistent state
         await self.state.load()
+        runtime_snapshot = await self.runtime_config.load_or_initialize(self.config)
+        self.monitor.apply_runtime_snapshot(runtime_snapshot)
         await self._cleanup_stale_waiting()
 
         # Connect to Twitch API if configured
@@ -140,6 +160,19 @@ class StreamRecorderApp:
         # Connect to Telegram
         if not await self.uploader.connect():
             raise RuntimeError("Failed to connect to Telegram")
+
+        if self.config.control.enabled:
+            if not self.uploader.client:
+                raise RuntimeError("Telegram client is not available for control mode")
+            self.telegram_controller = TelegramController(
+                client=self.uploader.client,
+                control_config=self.config.control,
+                runtime_config=self.runtime_config,
+                status_provider=self.build_control_status,
+                runtime_changed_callback=self.apply_runtime_config,
+                session_action_callback=self.control_session_action,
+            )
+            await self.telegram_controller.start()
 
         self._logger.info(
             f"Telegram: {'Premium' if self.uploader.is_premium else 'Regular'} account, "
@@ -255,6 +288,12 @@ class StreamRecorderApp:
 
         # Disconnect services with timeouts
         try:
+            if self.telegram_controller:
+                await self.telegram_controller.stop()
+        except Exception as e:
+            self._logger.warning(f"Error stopping Telegram controller: {e}")
+
+        try:
             if self.twitch_api:
                 await asyncio.wait_for(self.twitch_api.disconnect(), timeout=5.0)
         except Exception as e:
@@ -275,6 +314,290 @@ class StreamRecorderApp:
                 await self._cleanup_stale_waiting()
         except asyncio.CancelledError:
             pass
+
+    async def build_control_status(self) -> str:
+        """Build a concise runtime status for Telegram control group."""
+        snapshot = await self.runtime_config.get_snapshot()
+        incomplete = await self.state.get_incomplete_streams()
+        waiting = await self.state.get_waiting_streams()
+        active = sorted(self._active_recordings.keys())
+        processing = sorted(self._processing_channels)
+        enabled_sources = sum(1 for source in snapshot.sources.values() if source.enabled)
+        job_stats = await self.jobs.snapshot()
+        target_uploads = await self.upload_scheduler.snapshot()
+        uptime_sec = int((datetime.now() - self._uptime_started_at).total_seconds())
+
+        lines = [
+            "Stream Recorder status",
+            f"platform: {self.config.platform}",
+            f"targets: {len(snapshot.targets)}",
+            f"sources: {enabled_sources}/{len(snapshot.sources)} enabled",
+            f"active recordings: {len(active)}" + (f" ({', '.join(active)})" if active else ""),
+            f"processing: {len(processing)}" + (f" ({', '.join(processing)})" if processing else ""),
+            f"incomplete sessions: {len(incomplete)}",
+            f"waiting sessions: {len(waiting)}",
+            f"uptime: {uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m",
+        ]
+        if job_stats:
+            lines.append("jobs:")
+            for stats in job_stats.values():
+                lines.append(
+                    f"- {stats.name}: active={stats.active} queued={stats.queued} "
+                    f"done={stats.completed} failed={stats.failed} limit={stats.concurrency}"
+                )
+        if target_uploads:
+            lines.append("target uploads:")
+            for target_id, stats in target_uploads.items():
+                lines.append(
+                    f"- {target_id}: active={stats['active']} "
+                    f"queued={stats['queued']} limit={stats.get('limit', 1)}"
+                )
+        return "\n".join(lines)
+
+    async def control_session_action(self, action: str, channel: str) -> str:
+        """Apply control-plane action to an active or incomplete session."""
+        return await self.jobs.run(
+            "control",
+            f"{action}:{channel}",
+            lambda: self._control_session_action_unqueued(action, channel),
+        )
+
+    async def _control_session_action_unqueued(self, action: str, channel: str) -> str:
+        state = await self.state.get_state(channel)
+        if action in ("details", "info", "show"):
+            if not state:
+                return f"No active state for {channel}."
+            return await self._build_session_details(state)
+        if action == "stop":
+            self._skip_grace_for.add(channel)
+            stopped = await self.recorder.stop_recording(channel)
+            task = self._active_recordings.get(channel)
+            if task:
+                try:
+                    await asyncio.wait_for(task, timeout=30)
+                except asyncio.TimeoutError:
+                    return "Recording stop requested; recorder is still finalizing the file."
+            elif state and state.status == StreamStatus.RECORDING and state.recording_files:
+                await self.state.update_status(channel, StreamStatus.PROCESSING)
+                latest = await self.state.get_state(channel)
+                if latest:
+                    asyncio.create_task(self._process_recording_guarded(latest))
+                return "Recording already stopped; processing queued."
+            return "Recording stop requested." if stopped or task else "No active recording found."
+        if not state:
+            return f"No active state for {channel}."
+        if action in ("cancel", "abort"):
+            await self.state.set_control_flag(channel, "abort_requested", True)
+            stopped = await self.recorder.stop_recording(channel)
+            processing = self._cancel_processing_task(channel)
+            await self.state.update_status(channel, StreamStatus.ERROR, "Cancelled by Telegram control command")
+            # Archive the session so it is not auto-resumed on the next start.
+            # update_status/set_xxx calls from the cancelled processing task will
+            # become no-ops once the channel is gone from the active state map.
+            await self.state.archive_stream(channel)
+            parts = []
+            if stopped or channel in self._active_recordings:
+                parts.append("recording stop requested")
+            if processing:
+                parts.append("processing task cancelled")
+            parts.append("session archived")
+            return f"Cancelled {channel}: {', '.join(parts)}."
+        if action in ("cancel-upload", "stop-upload", "skip-upload"):
+            await self.state.set_control_flag(channel, "skip_upload", True)
+            processing = self._cancel_processing_task(channel) if state.status == StreamStatus.UPLOADING else False
+            if processing:
+                await self.state.update_status(channel, StreamStatus.ERROR, "Upload cancelled by Telegram control command")
+                return f"Upload cancellation requested for {channel}; processing task cancelled."
+            return f"Upload will be skipped for {channel}."
+        if action in ("cancel-compression", "stop-compression", "skip-compression"):
+            await self.state.set_control_flag(channel, "skip_compression", True)
+            processing = self._cancel_processing_task(channel) if state.status == StreamStatus.COMPRESSING else False
+            if processing:
+                await self.state.update_status(channel, StreamStatus.ERROR, "Compression cancelled by Telegram control command")
+                return f"Compression cancellation requested for {channel}; use retry-forwarding to continue backup forwarding."
+            return f"Compression will be skipped for {channel}."
+        if action in ("cancel-forwarding", "stop-forwarding", "skip-forwarding"):
+            await self.state.set_control_flag(channel, "skip_forwarding", True)
+            processing = self._cancel_processing_task(channel) if state.status == StreamStatus.FORWARDING else False
+            if processing:
+                await self.state.update_status(channel, StreamStatus.ERROR, "Forwarding cancelled by Telegram control command")
+                return f"Forwarding cancellation requested for {channel}; processing task cancelled."
+            return f"Backup forwarding will be skipped for {channel}."
+        if action in ("clear-flags", "reset-flags"):
+            await self.state.clear_control_flags(channel)
+            return f"Control flags cleared for {channel}."
+        if action == "recover":
+            if channel in self._active_recordings:
+                return f"{channel} is still recording; stop it first."
+            if channel not in self._recovery_tasks:
+                task = asyncio.create_task(self._recover_incomplete(only_channel=channel))
+                self._recovery_tasks[channel] = task
+                task.add_done_callback(lambda t: self._recovery_tasks.pop(channel, None))
+            return f"Recovery queued for {channel}."
+        if action in ("retry-upload", "reprocess"):
+            if channel in self._active_recordings or state.status == StreamStatus.RECORDING:
+                return f"{channel} is still recording; stop it before {action}."
+            if channel in self._processing_channels:
+                return f"{channel} is already processing; cancel or wait before {action}."
+            if not state.recording_files and not state.recording_file:
+                return f"No recording files are registered for {channel}."
+            await self.state.clear_control_flags(channel)
+            if action == "retry-upload":
+                if state.status not in {
+                    StreamStatus.PROCESSING,
+                    StreamStatus.UPLOADING,
+                    StreamStatus.COMPRESSING,
+                    StreamStatus.SENDING_COMPRESSED,
+                    StreamStatus.FORWARDING,
+                    StreamStatus.ERROR,
+                }:
+                    return f"retry-upload is not valid while state is {state.status.value}."
+                await self.state.clear_message_id(channel, 'upload')
+                await self.state.clear_message_id(channel, 'backup')
+                await self.state.clear_message_id(channel, 'compressed')
+            else:
+                await self.state.clear_message_id(channel, 'upload')
+                await self.state.clear_message_id(channel, 'backup')
+                await self.state.clear_message_id(channel, 'compressed')
+                await self.state.set_split_files(channel, [])
+            await self.state.update_status(channel, StreamStatus.PROCESSING)
+            latest = await self.state.get_state(channel)
+            if latest:
+                asyncio.create_task(self._process_recording_guarded(latest))
+            return f"{action} queued for {channel}."
+        if action == "retry-compression":
+            if channel in self._active_recordings or state.status == StreamStatus.RECORDING:
+                return f"{channel} is still recording; stop it before retry-compression."
+            if channel in self._processing_channels:
+                return f"{channel} is already processing; cancel or wait before retry-compression."
+            if not state.message_ids.upload_msgs and not state.uploaded_parts:
+                return f"No uploaded Telegram messages found for {channel}; retry upload first."
+            await self.state.clear_control_flags(channel)
+            await self.state.clear_message_id(channel, 'compressed')
+            await self.state.update_status(channel, StreamStatus.COMPRESSING)
+            latest = await self.state.get_state(channel)
+            if latest:
+                asyncio.create_task(self._process_recording_guarded(latest))
+            return f"Compression retry queued for {channel}."
+        if action == "retry-forwarding":
+            if channel in self._active_recordings or state.status == StreamStatus.RECORDING:
+                return f"{channel} is still recording; stop it before retry-forwarding."
+            if channel in self._processing_channels:
+                return f"{channel} is already processing; cancel or wait before retry-forwarding."
+            if not state.message_ids.upload_msgs and not state.uploaded_parts:
+                return f"No uploaded Telegram messages found for {channel}; retry upload first."
+            await self.state.clear_control_flags(channel)
+            await self.state.clear_message_id(channel, 'backup')
+            await self.state.update_status(channel, StreamStatus.FORWARDING)
+            latest = await self.state.get_state(channel)
+            if latest:
+                asyncio.create_task(self._resume_forwarding(latest))
+            return f"Forwarding retry queued for {channel}."
+        return "Unknown session action."
+
+    def _cancel_processing_task(self, channel: str) -> bool:
+        task = self._processing_tasks.get(channel)
+        if task and not task.done():
+            task.cancel()
+            return True
+        return False
+
+    async def _build_session_details(self, state: StreamState) -> str:
+        target = await self._get_target_for_channel(state.channel, state)
+        flags = []
+        if state.skip_upload:
+            flags.append("skip_upload")
+        if state.skip_compression:
+            flags.append("skip_compression")
+        if state.skip_forwarding:
+            flags.append("skip_forwarding")
+        if state.abort_requested:
+            flags.append("abort_requested")
+        return "\n".join([
+            f"Session: {state.channel}",
+            f"status: {state.status.value}",
+            f"session_id: {state.session_id or '-'}",
+            f"source_id: {state.source_id or '-'}",
+            f"target: {target.id} -> {target.upload_channel_id}",
+            f"discussion: {target.discussion_group_id or '-'}",
+            f"backup: {target.backup_channel_id or '-'}",
+            f"recording_files: {len(state.recording_files)}",
+            f"split_files: {len(state.split_files)}",
+            f"uploaded_parts: {len(state.uploaded_parts) or len(state.message_ids.upload_msgs)}",
+            f"compressed: {'yes' if state.compressed_file or state.message_ids.compressed_msg else 'no'}",
+            f"flags: {', '.join(flags) if flags else '-'}",
+            f"error: {state.error_message or '-'}",
+        ])
+
+    async def apply_runtime_config(self) -> None:
+        """Apply runtime config changes that are safe without restart."""
+        snapshot = await self.runtime_config.get_snapshot()
+        self.monitor.apply_runtime_snapshot(snapshot)
+
+    async def _get_source_for_channel(self, channel: str) -> Optional[SourceChannel]:
+        if not hasattr(self, "runtime_config"):
+            return None
+        snapshot = await self.runtime_config.get_snapshot()
+        platform = "youtube" if self._is_youtube_channel(channel) else "twitch"
+        for source in snapshot.sources.values():
+            if source.platform == platform and source.handle.lower() == channel.lower():
+                return source
+        return None
+
+    async def _get_target_for_channel(self, channel: str, state: Optional[StreamState] = None) -> TargetProfile:
+        if state and state.target_upload_channel_id:
+            return TargetProfile(
+                id=state.target_profile_id or "session",
+                name=state.target_profile_id or "session",
+                upload_channel_id=state.target_upload_channel_id,
+                discussion_group_id=state.target_discussion_group_id,
+                backup_channel_id=state.target_backup_channel_id,
+                upload_parallelism=(
+                    state.target_upload_parallelism
+                    if state.target_upload_parallelism is not None
+                    else self.config.telegram.upload_parallelism
+                ),
+                upload_speed_limit_mbps=(
+                    state.target_upload_speed_limit_mbps
+                    if state.target_upload_speed_limit_mbps is not None
+                    else self.config.telegram.upload_speed_limit_mbps
+                ),
+                compression_enabled=state.target_compression_enabled,
+                splitting_default_size_gb=state.target_splitting_default_size_gb,
+                splitting_premium_size_gb=state.target_splitting_premium_size_gb,
+            )
+        if not hasattr(self, "runtime_config"):
+            return TargetProfile(
+                id="legacy",
+                name="legacy",
+                upload_channel_id=getattr(self.uploader, "channel_id", 0),
+                discussion_group_id=getattr(self.uploader, "discussion_group_id", None),
+                backup_channel_id=getattr(self.uploader, "backup_channel_id", None),
+            )
+        snapshot = await self.runtime_config.get_snapshot()
+        source = None
+        platform = "youtube" if self._is_youtube_channel(channel) else "twitch"
+        for candidate in snapshot.sources.values():
+            if candidate.platform == platform and candidate.handle.lower() == channel.lower():
+                source = candidate
+                break
+        if source and source.target_profile_id in snapshot.targets:
+            return snapshot.targets[source.target_profile_id]
+        return snapshot.targets.get("default") or TargetProfile(
+            id="legacy",
+            name="legacy",
+            upload_channel_id=self.config.telegram.channel_id,
+            discussion_group_id=self.config.telegram.discussion_group_id,
+            backup_channel_id=self.config.telegram.backup_channel_id,
+            upload_parallelism=self.config.telegram.upload_parallelism,
+            upload_speed_limit_mbps=self.config.telegram.upload_speed_limit_mbps,
+            compression_enabled=self.config.compression.enabled,
+            splitting_default_size_gb=self.config.splitting.default_size_gb,
+            splitting_premium_size_gb=self.config.splitting.premium_size_gb,
+        )
+
+    async def _set_state_target_snapshot(self, channel: str, target: TargetProfile) -> None:
+        await self.state.set_target_snapshot(channel, target)
 
     async def _cleanup_stale_waiting(self) -> None:
         """Delete waiting entries older than configured timeout."""
@@ -308,9 +631,13 @@ class StreamRecorderApp:
                 continue
 
             logger = get_channel_logger(stream_state.channel)
+            target = await self._get_target_for_channel(stream_state.channel, current)
             try:
                 if current.message_ids.waiting_msg:
-                    await self.uploader.delete_message(current.message_ids.waiting_msg)
+                    await self.uploader.delete_message(
+                        current.message_ids.waiting_msg,
+                        target_channel_id=target.upload_channel_id
+                    )
             except Exception as e:
                 logger.warning(f"Failed to delete stale waiting message: {e}")
 
@@ -330,10 +657,17 @@ class StreamRecorderApp:
             return
 
         self._processing_channels.add(channel)
+        self._processing_tasks[channel] = asyncio.current_task()
         try:
-            await self._process_recording(state)
+            await self.jobs.run(
+                "processing",
+                channel,
+                lambda: self._process_recording(state),
+            )
         finally:
             self._processing_channels.discard(channel)
+            if self._processing_tasks.get(channel) == asyncio.current_task():
+                self._processing_tasks.pop(channel, None)
             if channel in self._pending_live_recheck and not self._shutting_down:
                 self._pending_live_recheck.discard(channel)
                 asyncio.create_task(self._recheck_live_after_processing(channel))
@@ -349,11 +683,7 @@ class StreamRecorderApp:
         if channel in self._active_recordings or channel in self._processing_channels:
             return
 
-        is_youtube = channel.startswith('@') or channel.startswith('UC')
-        if is_youtube:
-            live_info = await self.monitor.check_youtube_live(channel)
-        else:
-            live_info = await self.monitor.check_twitch_live(channel)
+        live_info = await self._check_channel_live(channel)
 
         if not live_info:
             logger.info("Deferred live recheck: stream is offline")
@@ -365,6 +695,78 @@ class StreamRecorderApp:
     def _cross_session_key(self, yt_channel: str, session_id: Optional[str]) -> str:
         """Build unique key for one YouTube session in cross mode."""
         return f"{yt_channel}:{session_id or 'nosession'}"
+
+    def _is_youtube_channel(self, channel: str) -> bool:
+        """Return True for configured YouTube channel identifiers."""
+        return channel.startswith('@') or channel.startswith('UC')
+
+    def _offline_grace_period_for_channel(self, channel: str) -> int:
+        """Return platform-specific grace period before processing."""
+        if self._is_youtube_channel(channel):
+            return 0
+        return self.config.twitch.offline_grace_period
+
+    async def _check_channel_live(self, channel: str) -> Optional[StreamInfo]:
+        """Check live status using the channel's platform monitor."""
+        if self._is_youtube_channel(channel):
+            return await self.monitor.check_youtube_live(channel)
+        return await self.monitor.check_twitch_live(channel)
+
+    async def _recover_cross_linked_files(self, stream_state: StreamState, logger) -> None:
+        """Attach completed cross-mode Twitch files that survived a crash."""
+        if self.config.platform != "cross" or not stream_state.linked_channel:
+            return
+
+        linked_channel = stream_state.linked_channel
+        known = set(stream_state.linked_recording_files or [])
+        try:
+            ts_raw = stream_state.started_at or stream_state.detected_at
+            cutoff = datetime.fromisoformat(ts_raw).timestamp() - 600 if ts_raw else 0
+        except Exception:
+            cutoff = 0
+
+        recovered: list[str] = []
+        for directory in (Path(self.config.recording.output_dir), Path(self.config.recording.temp_dir)):
+            if not directory.exists():
+                continue
+            channel_safe = linked_channel.lower()
+            patterns = [
+                f"{channel_safe}_*.ts",
+                f"{channel_safe}_*.mp4",
+                f"{channel_safe}_*.mkv",
+                f"temp_{channel_safe}_*.ts",
+                f"temp_{channel_safe}_*.mp4",
+                f"temp_{channel_safe}_*.mkv",
+            ]
+            for pattern in patterns:
+                for candidate in directory.glob(pattern):
+                    if not self._is_recoverable_recording_temp_file(candidate):
+                        continue
+                    try:
+                        if candidate.stat().st_size <= 0 or candidate.stat().st_mtime < cutoff:
+                            continue
+                    except Exception:
+                        continue
+
+                    final_path = candidate
+                    if directory == Path(self.config.recording.temp_dir):
+                        output_name = candidate.name[5:] if candidate.name.startswith('temp_') else candidate.name
+                        final_path = Path(self.config.recording.output_dir) / output_name
+                        if not final_path.exists():
+                            try:
+                                candidate.rename(final_path)
+                            except Exception as e:
+                                logger.warning(f"Cross recovery: failed to move linked temp file {candidate.name}: {e}")
+                                continue
+
+                    final_str = str(final_path)
+                    if final_str not in known and final_str not in recovered:
+                        recovered.append(final_str)
+
+        for file_path in sorted(recovered):
+            await self.state.add_linked_recording_file(stream_state.channel, file_path)
+            stream_state.linked_recording_files.append(file_path)
+            logger.info(f"Cross recovery: attached linked Twitch recording {Path(file_path).name}")
 
     async def _recover_incomplete(self, only_channel: Optional[str] = None) -> None:
         """Recover incomplete operations from previous run."""
@@ -381,7 +783,19 @@ class StreamRecorderApp:
         for stream_state in incomplete:
             logger = get_channel_logger(stream_state.channel)
 
+            # Honor explicit cancellation: do NOT auto-resume the pipeline,
+            # archive the session so it is removed from active state.
+            if stream_state.abort_requested:
+                logger.info(
+                    "Skipping recovery: session was cancelled via control command "
+                    f"(status={stream_state.status.value}); archiving"
+                )
+                await self.state.archive_stream(stream_state.channel)
+                continue
+
             try:
+                await self._recover_cross_linked_files(stream_state, logger)
+
                 if stream_state.status in (StreamStatus.RECORDING, StreamStatus.ERROR):
                     # Recording was interrupted or failed during merge/process
                     if stream_state.recording_file and Path(stream_state.recording_file).exists():
@@ -540,6 +954,9 @@ class StreamRecorderApp:
 
         # Get state
         state = await self.state.get_state(channel)
+        target = await self._get_target_for_channel(channel, state)
+        if state and not state.target_upload_channel_id:
+            await self._set_state_target_snapshot(channel, target)
 
         # ONLY handle info changes if we are NOT recording and NOT processing
         if channel in self._active_recordings:
@@ -556,7 +973,8 @@ class StreamRecorderApp:
                 state.message_ids.waiting_msg,
                 channel,
                 info.title,
-                info.category
+                info.category,
+                target_channel_id=target.upload_channel_id
             )
             await self.state.update_title_category(channel, info.title, info.category)
             logger.info("Updated waiting message")
@@ -566,11 +984,16 @@ class StreamRecorderApp:
                 channel=channel,
                 title=info.title,
                 category=info.category,
-                status=StreamStatus.WAITING
+                status=StreamStatus.WAITING,
+                source_id=source_id_for_channel(channel),
             )
+            await self._set_state_target_snapshot(channel, target)
 
             msg_id = await self.uploader.send_waiting_message(
-                channel, info.title, info.category
+                channel,
+                info.title,
+                info.category,
+                target_channel_id=target.upload_channel_id
             )
 
             if msg_id:
@@ -593,6 +1016,9 @@ class StreamRecorderApp:
 
         # Get existing state
         state = await self.state.get_state(channel)
+        target = await self._get_target_for_channel(channel, state)
+        if state and not state.target_upload_channel_id:
+            await self._set_state_target_snapshot(channel, target)
 
         # Guard against state corruption: if previous session is still being recovered/processed,
         # do not overwrite active state with a new stream yet.
@@ -637,7 +1063,10 @@ class StreamRecorderApp:
 
             # Delete waiting message if exists
             if state and state.message_ids.waiting_msg:
-                await self.uploader.delete_message(state.message_ids.waiting_msg)
+                await self.uploader.delete_message(
+                    state.message_ids.waiting_msg,
+                    target_channel_id=target.upload_channel_id
+                )
                 await self.state.clear_message_id(channel, 'waiting')
 
             # Create new state
@@ -646,11 +1075,14 @@ class StreamRecorderApp:
                     channel=channel,
                     title=info.title,
                     category=info.category,
-                    status=StreamStatus.RECORDING
+                    status=StreamStatus.RECORDING,
+                    source_id=source_id_for_channel(channel),
                 )
+                await self._set_state_target_snapshot(channel, target)
             else:
                 await self.state.update_title_category(channel, info.title, info.category)
                 await self.state.update_status(channel, StreamStatus.RECORDING)
+                await self._set_state_target_snapshot(channel, target)
 
             # Capture stream-start title/category for final caption
             await self.state.start_recording(channel)
@@ -664,16 +1096,27 @@ class StreamRecorderApp:
             await self.state.clear_message_id(channel, 'upload')
             await self.state.clear_message_id(channel, 'backup')
             await self.state.clear_message_id(channel, 'compressed')
+            await self.state.clear_control_flags(channel)
 
             # Send status message
             msg_id = await self.uploader.send_status_message(
-                channel, info.title, info.category, STATUS_ICONS[StreamStatus.RECORDING]
+                channel,
+                info.title,
+                info.category,
+                STATUS_ICONS[StreamStatus.RECORDING],
+                target_channel_id=target.upload_channel_id
             )
             if msg_id:
                 await self.state.set_message_id(channel, 'status', msg_id)
 
         # Start recording task
-        task = asyncio.create_task(self._record_stream(channel, info))
+        task = asyncio.create_task(
+            self.jobs.run(
+                "recording",
+                channel,
+                lambda: self._record_stream(channel, info),
+            )
+        )
         self._active_recordings[channel] = task
 
         logger.info(f"Started recording: {info.title}")
@@ -834,7 +1277,7 @@ class StreamRecorderApp:
                 else:
                     # WAIT for monitor's grace period to complete before processing
                     # This prevents processing while stream might come back
-                    grace_period = self.config.twitch.offline_grace_period
+                    grace_period = self._offline_grace_period_for_channel(channel)
                     if grace_period > 0:
                         logger.info(f"⏳ Waiting {grace_period}s grace period before processing...")
 
@@ -868,7 +1311,7 @@ class StreamRecorderApp:
                             # 2. Explicit check (Active check)
                             # Helps if monitor loop is stuck or slow
                             try:
-                                stream_live_now = await self.monitor.check_twitch_live(channel)
+                                stream_live_now = await self._check_channel_live(channel)
                                 if stream_live_now:
                                     logger.info("🔴 Stream is live (explicit check)! Restarting recording...")
                                     # Trigger new recording via event handler logic
@@ -895,7 +1338,7 @@ class StreamRecorderApp:
                         logger.info(f"📼 Processing {len(all_files)} segments from session {state.session_id}")
 
                     # CROSS MODE: After YouTube ends, check if Twitch is live
-                    is_youtube = channel.startswith('@') or channel.startswith('UC')
+                    is_youtube = self._is_youtube_channel(channel)
 
                     if self.config.platform == "cross" and is_youtube:
                         await self._handle_cross_mode_transition(channel, result.output_path)
@@ -935,10 +1378,12 @@ class StreamRecorderApp:
         twitch_channel = twitch_info.channel
         logger.info(f"Cross mode: Twitch stream active on {twitch_channel}, starting recording...")
 
-        # Create state for Twitch recording, linked to YouTube.
-        # If previous Twitch state is still processing, do not overwrite it.
+        # Do not create a persistent Twitch state here. The Twitch recording is
+        # attached to the YouTube session, so a standalone active state would be
+        # recovered and uploaded as a duplicate after restart.
         existing_state = await self.state.get_state(twitch_channel)
         busy_statuses = {
+            StreamStatus.RECORDING,
             StreamStatus.PROCESSING,
             StreamStatus.UPLOADING,
             StreamStatus.COMPRESSING,
@@ -951,19 +1396,20 @@ class StreamRecorderApp:
             )
             return
 
-        await self.state.create_stream(
-            channel=twitch_channel,
-            title=twitch_info.title,
-            category=twitch_info.category,
-            status=StreamStatus.RECORDING
-        )
-
-        # Link YT and Twitch states.
+        # Link only from YT state; Twitch is a transient continuation task.
         await self.state.update_linked_channel(yt_channel, twitch_channel)
-        await self.state.update_linked_channel(twitch_channel, yt_channel)
 
         # Start Twitch recording in background and remember it to prevent duplicate starts.
-        twitch_task = asyncio.create_task(self._record_twitch_for_cross(yt_channel, twitch_info))
+        if hasattr(self, "jobs"):
+            twitch_task = asyncio.create_task(
+                self.jobs.run(
+                    "recording",
+                    twitch_channel,
+                    lambda: self._record_twitch_for_cross(yt_channel, twitch_info),
+                )
+            )
+        else:
+            twitch_task = asyncio.create_task(self._record_twitch_for_cross(yt_channel, twitch_info))
         self._cross_twitch_tasks[cross_key] = twitch_task
         self._active_recordings[twitch_channel] = twitch_task
 
@@ -994,9 +1440,6 @@ class StreamRecorderApp:
             result = await self.recorder.record_stream(twitch_info)
 
             if result.status.value == 'completed' and result.output_path:
-                await self.state.set_recording_file(twitch_channel, result.output_path)
-                await self.state.end_recording(twitch_channel)
-
                 # Add Twitch recording to linked files on YT state
                 await self.state.add_linked_recording_file(yt_channel, result.output_path)
 
@@ -1050,10 +1493,19 @@ class StreamRecorderApp:
         """Process a completed recording (supports multiple segments)."""
         channel = state.channel
         logger = get_channel_logger(channel)
+        target = await self._get_target_for_channel(channel, state)
+        if not state.target_upload_channel_id:
+            await self._set_state_target_snapshot(channel, target)
+            latest_state = await self.state.get_state(channel)
+            if latest_state:
+                state = latest_state
 
         # Check if we are shutting down
         if self._shutting_down:
             logger.info("Shutting down - skipping upload. Will resume on next start.")
+            return
+        if state.abort_requested:
+            await self.state.update_status(channel, StreamStatus.ERROR, "Processing aborted by Telegram control command")
             return
 
         # Get all recording files for this session
@@ -1081,18 +1533,24 @@ class StreamRecorderApp:
         # VALIDATE: Check each file is readable before processing
         valid_files = []
         for recording_file in existing_files:
+            validate_proc = None
             try:
                 validate_proc = await asyncio.create_subprocess_exec(
                     'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                     '-of', 'default=noprint_wrappers=1:nokey=1', recording_file,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await validate_proc.communicate()
+                stdout, stderr = await asyncio.wait_for(validate_proc.communicate(), timeout=120)
                 duration_str = stdout.decode().strip()
                 if duration_str and validate_proc.returncode == 0:
                     valid_files.append(recording_file)
                 else:
                     logger.warning(f"Segment corrupted/incomplete, skipping: {Path(recording_file).name}")
+            except asyncio.TimeoutError:
+                if validate_proc and validate_proc.returncode is None:
+                    validate_proc.kill()
+                    await validate_proc.wait()
+                logger.warning(f"Timed out validating segment, skipping: {Path(recording_file).name}")
             except Exception as e:
                 logger.warning(f"Failed to validate segment {Path(recording_file).name}: {e}")
 
@@ -1109,11 +1567,15 @@ class StreamRecorderApp:
             # Update status: Processing
             await self._update_status_msg(state, StreamStatus.PROCESSING)
             await self.state.update_status(channel, StreamStatus.PROCESSING)
+            latest_state = await self.state.get_state(channel)
+            if latest_state and latest_state.abort_requested:
+                await self.state.update_status(channel, StreamStatus.ERROR, "Processing aborted by Telegram control command")
+                return
 
             size_limit_gb = (
-                self.config.splitting.premium_size_gb
+                (target.splitting_premium_size_gb or self.config.splitting.premium_size_gb)
                 if self.uploader.is_premium
-                else self.config.splitting.default_size_gb
+                else (target.splitting_default_size_gb or self.config.splitting.default_size_gb)
             )
 
             filtered_files = await self._filter_tail_phantoms_before_processing(
@@ -1139,6 +1601,7 @@ class StreamRecorderApp:
                 # Resume from existing split files
                 logger.info(f"📂 Found {len(valid_split_files)} existing split files, skipping re-split")
                 all_split_files = valid_split_files
+                upload_source_files = valid_split_files
             else:
                 if existing_split_files or state.uploaded_parts or state.message_ids.upload_msgs:
                     logger.info("Regenerating upload-safe split files; clearing stale upload state")
@@ -1206,14 +1669,13 @@ class StreamRecorderApp:
             split_files = all_split_files
 
             # Update status: Uploading
-            await self._update_status_msg(state, StreamStatus.UPLOADING)
-            await self.state.update_status(channel, StreamStatus.UPLOADING)
+            latest_state = await self.state.get_state(channel)
+            upload_skipped = bool(latest_state and latest_state.skip_upload)
 
             # Calculate total duration from all segments
             total_duration_str = await self._format_duration_multi(filtered_files)
 
             # Resume-safe upload: skip parts that were already uploaded.
-            latest_state = await self.state.get_state(channel)
             uploaded_parts = dict(latest_state.uploaded_parts) if latest_state else {}
             uploaded_parts = {
                 path: msg_id
@@ -1231,35 +1693,82 @@ class StreamRecorderApp:
                     if msg_id:
                         uploaded_parts[file_path] = msg_id
 
-            pending_split_files = [p for p in split_files if p not in uploaded_parts]
-            if uploaded_parts:
-                logger.info(
-                    f"Resuming upload: {len(uploaded_parts)} already uploaded, "
-                    f"{len(pending_split_files)} pending"
-                )
-
             failed_by_path: Dict[str, UploadResult] = {}
-            if pending_split_files:
-                pending_result = await self.uploader.upload_stream_parts(
-                    stream_info=self._state_to_stream_info(state),
-                    file_paths=pending_split_files,
-                    duration_str=total_duration_str
-                )
+            pending_split_files = [p for p in split_files if p not in uploaded_parts]
 
-                for result in pending_result.results:
-                    if result.success and result.message_id:
+            if upload_skipped:
+                if pending_split_files:
+                    logger.warning(
+                        "Upload stage skipped by Telegram control command; "
+                        f"{len(pending_split_files)}/{len(split_files)} parts will not be uploaded. "
+                        "Files kept on disk for manual handling."
+                    )
+                else:
+                    logger.info(
+                        "Upload stage already complete; skip-upload flag has nothing to skip"
+                    )
+            else:
+                await self._update_status_msg(state, StreamStatus.UPLOADING)
+                await self.state.update_status(channel, StreamStatus.UPLOADING)
+
+                async def run_upload_pipeline() -> BatchUploadResult:
+                    nonlocal uploaded_parts, failed_by_path
+                    pending_split_files = [p for p in split_files if p not in uploaded_parts]
+                    if uploaded_parts:
+                        logger.info(
+                            f"Resuming upload: {len(uploaded_parts)} already uploaded, "
+                            f"{len(pending_split_files)} pending"
+                        )
+
+                    async def persist_uploaded_part(result: UploadResult) -> None:
                         uploaded_parts[result.file_path] = result.message_id
                         await self.state.set_uploaded_part(channel, result.file_path, result.message_id)
-                    else:
-                        failed_by_path[result.file_path] = result
-            else:
-                pending_result = BatchUploadResult(
-                    channel=state.channel,
-                    stream_info=self._state_to_stream_info(state),
-                    total_parts=0,
-                    successful_uploads=0,
-                    failed_uploads=0,
-                    results=[]
+
+                    if pending_split_files:
+                        first_pending_index = split_files.index(pending_split_files[0])
+                        album_index_offset = first_pending_index // 10
+                        album_total = (len(split_files) + 9) // 10
+                        async with self.uploader.upload_runtime(
+                            target.upload_parallelism,
+                            target.upload_speed_limit_mbps,
+                        ):
+                            pending = await self.uploader.upload_stream_parts(
+                                stream_info=self._state_to_stream_info(state),
+                                file_paths=pending_split_files,
+                                duration_str=total_duration_str if first_pending_index == 0 else "",
+                                part_uploaded_callback=persist_uploaded_part,
+                                target_channel_id=target.upload_channel_id,
+                                start_part_num=first_pending_index + 1,
+                                total_parts_override=len(split_files),
+                                album_index_offset=album_index_offset,
+                                album_total_override=album_total,
+                            )
+
+                        for result in pending.results:
+                            if result.success and result.message_id:
+                                uploaded_parts[result.file_path] = result.message_id
+                                await self.state.set_uploaded_part(channel, result.file_path, result.message_id)
+                            else:
+                                failed_by_path[result.file_path] = result
+                        return pending
+
+                    return BatchUploadResult(
+                        channel=state.channel,
+                        stream_info=self._state_to_stream_info(state),
+                        total_parts=0,
+                        successful_uploads=0,
+                        failed_uploads=0,
+                        results=[]
+                    )
+
+                pending_result = await self.jobs.run(
+                    "upload",
+                    f"{target.id}:{channel}",
+                    lambda: self.upload_scheduler.run(
+                        target.id,
+                        target.upload_parallelism,
+                        run_upload_pipeline,
+                    ),
                 )
 
             combined_results: list[UploadResult] = []
@@ -1281,7 +1790,7 @@ class StreamRecorderApp:
                             file_path=file_path,
                             message_id=None,
                             success=False,
-                            error="Missing upload result"
+                            error="Upload skipped by control command" if upload_skipped else "Missing upload result"
                         )
                     )
 
@@ -1298,8 +1807,9 @@ class StreamRecorderApp:
 
             logger.info(f"Uploaded {upload_result.successful_uploads}/{upload_result.total_parts}")
 
-            # Stop here if any uploads failed (keep files for retry)
-            if upload_result.failed_uploads > 0:
+            # Stop here only when real uploads failed; explicit skip is allowed
+            # to fall through and archive the session via complete_stream below.
+            if upload_result.failed_uploads > 0 and not upload_skipped:
                 msg = f"Upload incomplete: {upload_result.failed_uploads}/{upload_result.total_parts} failed"
                 logger.error(msg)
                 await self.state.update_status(channel, StreamStatus.UPLOADING, msg)
@@ -1308,7 +1818,16 @@ class StreamRecorderApp:
             # Compress if enabled AND file was split (meaning it exceeded upload limits)
             compressed_file = None
             compression_failed = False  # Флаг для отслеживания провала сжатия
-            if self.config.compression.enabled:
+            compression_enabled = (
+                self.config.compression.enabled
+                if target.compression_enabled is None
+                else target.compression_enabled
+            )
+            latest_state = await self.state.get_state(channel)
+            if latest_state and latest_state.skip_compression:
+                compression_enabled = False
+                logger.info("Compression skipped by Telegram control command")
+            if compression_enabled:
                 # If file fits in one part, user likely doesn't want a compressed copy
                 if len(split_files) == 1:
                     logger.info("Skipping compression: file fits within upload limits (single part)")
@@ -1347,15 +1866,21 @@ class StreamRecorderApp:
                             logger.error("Compression skipped: failed to concat segments")
 
                     if compression_input:
-                        result = await self.compressor.compress_to_size(
-                            compression_input,
-                            target_size_mb=target_size
+                        result = await self.jobs.run(
+                            "compression",
+                            channel,
+                            lambda: self.compressor.compress_to_size(
+                                compression_input,
+                                target_size_mb=target_size
+                            ),
                         )
 
-                        if result.success and result.output_file:
+                        if result.success and result.output_file and Path(result.output_file) != Path(compression_input):
                             compressed_file = result.output_file
                             await self.state.set_compressed_file(channel, compressed_file)
                             logger.info(f"Compressed: {result.size_reduction_percent:.1f}% reduction")
+                        elif result.success and result.output_file:
+                            logger.info("Skipping compressed comment: compressor returned original file")
                         else:
                             # Сжатие провалилось - НЕ удаляем оригинал!
                             compression_failed = True
@@ -1369,7 +1894,11 @@ class StreamRecorderApp:
                 first_msg_id = upload_result.results[0].message_id
                 if first_msg_id:
                     msg_id = await self.uploader.send_to_discussion(
-                        first_msg_id, compressed_file, "📦 Сжатая версия"
+                        first_msg_id,
+                        compressed_file,
+                        "📦 Сжатая версия",
+                        target_channel_id=target.upload_channel_id,
+                        discussion_group_id=target.discussion_group_id
                     )
                     if msg_id:
                         await self.state.set_message_id(channel, 'compressed', msg_id)
@@ -1404,12 +1933,25 @@ class StreamRecorderApp:
                                     compressed_note="✅ Сжатый файл отправлен"
                                 )
 
-                                await self.uploader.update_message_caption(first_album_msg, caption)
+                                await self.uploader.update_message_caption(
+                                    first_album_msg,
+                                    caption,
+                                    target_channel_id=target.upload_channel_id
+                                )
                         except Exception as e:
                             logger.warning(f"Failed to update album captions: {e}")
+                    else:
+                        msg = "Failed to send compressed file to discussion"
+                        logger.error(msg)
+                        await self.state.update_status(channel, StreamStatus.SENDING_COMPRESSED, msg)
+                        return
 
             # Forward to backup
-            if self.uploader.backup_channel_id:
+            latest_state = await self.state.get_state(channel)
+            forwarding_skipped = bool(latest_state and latest_state.skip_forwarding)
+            if forwarding_skipped:
+                logger.info("Backup forwarding skipped by Telegram control command")
+            if target.backup_channel_id and not forwarding_skipped:
                 await self._update_status_msg(state, StreamStatus.FORWARDING)
                 await self.state.update_status(channel, StreamStatus.FORWARDING)
 
@@ -1426,24 +1968,57 @@ class StreamRecorderApp:
                     if state.message_ids.compressed_msg:
                         msg_ids.append(state.message_ids.compressed_msg)
 
-                    forwarded = await self.uploader.forward_to_backup(msg_ids)
-                    for fwd_id in forwarded:
-                        await self.state.set_message_id(channel, 'backup', fwd_id)
+                    if not msg_ids:
+                        if upload_skipped:
+                            logger.info(
+                                "Skipping backup forwarding: no uploaded messages "
+                                "(upload was skipped by control command)"
+                            )
+                        else:
+                            msg = "No uploaded message IDs available for backup forwarding"
+                            logger.error(msg)
+                            await self.state.update_status(channel, StreamStatus.FORWARDING, msg)
+                            return
+                    else:
+                        forwarded = await self.uploader.forward_to_backup(
+                            msg_ids,
+                            source_channel_id=target.upload_channel_id,
+                            backup_channel_id=target.backup_channel_id
+                        )
+                        if len(forwarded) != len(msg_ids):
+                            msg = f"Backup forwarding incomplete: {len(forwarded)}/{len(msg_ids)} forwarded"
+                            logger.error(msg)
+                            await self.state.update_status(channel, StreamStatus.FORWARDING, msg)
+                            return
+                        for fwd_id in forwarded:
+                            await self.state.set_message_id(channel, 'backup', fwd_id)
 
             # Delete status message
             state = await self.state.get_state(channel)
             if state and state.message_ids.status_msg:
-                await self.uploader.delete_message(state.message_ids.status_msg)
+                await self.uploader.delete_message(
+                    state.message_ids.status_msg,
+                    target_channel_id=target.upload_channel_id
+                )
 
             # Complete!
             await self.state.complete_stream(channel)
             logger.info("Processing complete!")
 
-            # Cleanup split files
-            # НЕ удаляем оригинал, если сжатие было запланировано но провалилось!
-            await self._cleanup_files(split_files, valid_files, compressed_file, compression_failed)
-            await self._cleanup_generated_upload_files(generated_upload_files, split_files)
+            # Cleanup split files. Keep originals when upload was skipped, so
+            # the user can retry/inspect the recording on disk after archiving.
+            if upload_skipped:
+                logger.info(
+                    "Upload was skipped; keeping original recording files on disk"
+                )
+            else:
+                await self._cleanup_files(split_files, valid_files, compressed_file, compression_failed)
+                await self._cleanup_generated_upload_files(generated_upload_files, split_files)
 
+        except asyncio.CancelledError:
+            logger.warning("Processing task cancelled by Telegram control command")
+            await self.state.update_status(channel, StreamStatus.ERROR, "Processing cancelled by Telegram control command")
+            raise
         except Exception as e:
             logger.error(f"Processing error: {e}")
             await self.state.update_status(channel, StreamStatus.ERROR, str(e))
@@ -1459,9 +2034,15 @@ class StreamRecorderApp:
         """Resume sending compressed file to discussion."""
         channel = state.channel
         logger = get_channel_logger(channel)
+        target = await self._get_target_for_channel(channel, state)
 
         try:
             compressed_file = state.compressed_file
+
+            if state.message_ids.compressed_msg:
+                logger.info("Compressed file already sent, skipping duplicate comment send")
+                await self._resume_forwarding(state)
+                return
 
             # Get first upload message ID for reply
             if state.message_ids.upload_msgs:
@@ -1470,11 +2051,20 @@ class StreamRecorderApp:
                 await self._update_status_msg(state, StreamStatus.SENDING_COMPRESSED)
 
                 msg_id = await self.uploader.send_to_discussion(
-                    first_msg_id, compressed_file, "📦 Сжатая версия"
+                    first_msg_id,
+                    compressed_file,
+                    "📦 Сжатая версия",
+                    target_channel_id=target.upload_channel_id,
+                    discussion_group_id=target.discussion_group_id
                 )
                 if msg_id:
                     await self.state.set_message_id(channel, 'compressed', msg_id)
                     logger.info("Sent compressed file to discussion")
+                else:
+                    msg = "Failed to send compressed file to discussion"
+                    logger.error(msg)
+                    await self.state.update_status(channel, StreamStatus.SENDING_COMPRESSED, msg)
+                    return
 
             # Continue to forwarding
             await self._resume_forwarding(state)
@@ -1487,10 +2077,21 @@ class StreamRecorderApp:
         """Resume forwarding to backup channel."""
         channel = state.channel
         logger = get_channel_logger(channel)
+        target = await self._get_target_for_channel(channel, state)
 
         try:
+            # Honor /session skip-forwarding flag set via control plane: don't
+            # forward, just finalize the session so it leaves active state.
+            latest_state = await self.state.get_state(channel)
+            forwarding_skipped = bool(latest_state and latest_state.skip_forwarding)
+            if forwarding_skipped:
+                logger.info(
+                    "Backup forwarding skipped by Telegram control command; "
+                    "finalizing session without forwarding"
+                )
+
             # Forward to backup if configured
-            if self.uploader.backup_channel_id:
+            if target.backup_channel_id and not forwarding_skipped:
                 await self._update_status_msg(state, StreamStatus.FORWARDING)
                 await self.state.update_status(channel, StreamStatus.FORWARDING)
 
@@ -1498,12 +2099,33 @@ class StreamRecorderApp:
                 state = await self.state.get_state(channel)
                 if state:
                     msg_ids = state.message_ids.upload_msgs.copy()
+                    if not msg_ids and state.uploaded_parts:
+                        msg_ids = [
+                            state.uploaded_parts[path]
+                            for path in state.split_files
+                            if path in state.uploaded_parts
+                        ]
                     if state.message_ids.compressed_msg:
                         msg_ids.append(state.message_ids.compressed_msg)
 
                     # Only forward if we have messages and haven't forwarded yet
-                    if msg_ids and not state.message_ids.backup_msgs:
-                        forwarded = await self.uploader.forward_to_backup(msg_ids)
+                    if not msg_ids:
+                        msg = "No uploaded message IDs available for backup forwarding"
+                        logger.error(msg)
+                        await self.state.update_status(channel, StreamStatus.FORWARDING, msg)
+                        return
+
+                    if not state.message_ids.backup_msgs:
+                        forwarded = await self.uploader.forward_to_backup(
+                            msg_ids,
+                            source_channel_id=target.upload_channel_id,
+                            backup_channel_id=target.backup_channel_id
+                        )
+                        if len(forwarded) != len(msg_ids):
+                            msg = f"Backup forwarding incomplete: {len(forwarded)}/{len(msg_ids)} forwarded"
+                            logger.error(msg)
+                            await self.state.update_status(channel, StreamStatus.FORWARDING, msg)
+                            return
                         for fwd_id in forwarded:
                             await self.state.set_message_id(channel, 'backup', fwd_id)
                         logger.info(f"Forwarded {len(forwarded)} messages to backup")
@@ -1511,7 +2133,10 @@ class StreamRecorderApp:
             # Delete status message
             state = await self.state.get_state(channel)
             if state and state.message_ids.status_msg:
-                await self.uploader.delete_message(state.message_ids.status_msg)
+                await self.uploader.delete_message(
+                    state.message_ids.status_msg,
+                    target_channel_id=target.upload_channel_id
+                )
 
             # Complete!
             await self.state.complete_stream(channel)
@@ -1532,12 +2157,14 @@ class StreamRecorderApp:
     async def _update_status_msg(self, state: StreamState, status: StreamStatus) -> None:
         """Update status message in Telegram."""
         if state.message_ids.status_msg:
+            target = await self._get_target_for_channel(state.channel, state)
             await self.uploader.update_status(
                 state.message_ids.status_msg,
                 state.channel,
                 state.title,
                 state.category,
-                STATUS_ICONS[status]
+                STATUS_ICONS[status],
+                target_channel_id=target.upload_channel_id
             )
 
     def _state_to_stream_info(self, state: StreamState) -> StreamInfo:

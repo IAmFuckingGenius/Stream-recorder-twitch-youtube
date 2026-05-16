@@ -128,6 +128,23 @@ class StreamMonitor:
         for channel in self.channels:
             self._states[channel] = StreamStatus.UNKNOWN
 
+    def update_channels(self, channels: list[str]) -> None:
+        """Replace monitored channel list while keeping useful state."""
+        normalized = [ch.lower() for ch in channels]
+        new_set = set(normalized)
+        old_set = set(self.channels)
+
+        for channel in new_set - old_set:
+            self._states[channel] = StreamStatus.UNKNOWN
+
+        for channel in old_set - new_set:
+            self._states.pop(channel, None)
+            self._last_info.pop(channel, None)
+            self._offline_since.pop(channel, None)
+
+        self.channels = normalized
+        self._logger.info(f"Twitch monitor channels updated: {len(self.channels)}")
+
     def stop(self) -> None:
         """Stop monitoring."""
         self._running = False
@@ -166,6 +183,9 @@ class StreamMonitor:
         events = []
 
         # Get stream status for all channels (batch request)
+        if not self.channels:
+            return events
+
         streams = await self.api.get_streams_batch(self.channels)
         if streams is None:
             self._logger.warning("Twitch stream check failed; keeping previous states")

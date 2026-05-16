@@ -88,6 +88,7 @@ class TwitchAPI:
 
             # Get app access token
             if not await self._refresh_token():
+                await self.disconnect()
                 return False
 
             self._logger.info("Connected to Twitch API")
@@ -95,6 +96,7 @@ class TwitchAPI:
 
         except Exception as e:
             self._logger.error(f"Failed to connect: {e}")
+            await self.disconnect()
             return False
 
     async def disconnect(self) -> None:

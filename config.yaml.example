@@ -69,5 +69,24 @@ logging:
   ytdlp_log_noise: false              # include noisy yt-dlp connection/progress lines
 
 state:
-  state_file: ./data/state.json
+  state_file: ./data/state.sqlite3
   waiting_timeout_hours: 6            # auto-clean stale WAITING state/messages after timeout
+
+jobs:
+  recording_concurrency: 4            # simultaneous recording tasks
+  processing_concurrency: 2           # ffprobe/remux/split pipelines
+  upload_concurrency: 1               # upload pipelines across all targets
+  compression_concurrency: 1          # ffmpeg compression jobs
+  control_concurrency: 2              # Telegram control actions
+
+control:
+  enabled: false                      # Telegram control group listener
+  group_id: null                      # Dedicated admin group ID, e.g. -1001234567890
+  allowed_user_ids: []                # User IDs allowed to mutate runtime config (sources, targets, sessions)
+  readonly_user_ids: []               # User IDs allowed only to read status/config
+  allow_all_group_members: false      # If true, every member of group_id is accepted; only enable for private/trusted groups.
+                                      # If both allowed_user_ids and readonly_user_ids are empty AND this flag is false,
+                                      # control loading will fail to prevent accidental open access.
+  command_prefix: "/"
+  runtime_config_file: ./data/runtime_config.sqlite3
+  audit_log_file: ./logs/control_audit.log

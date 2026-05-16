@@ -351,6 +351,10 @@ class StreamRecorder:
             return False
         return True
 
+    def _retry_value(self, configured: int) -> str:
+        """Convert configured retry count to yt-dlp CLI value."""
+        return str(max(0, int(configured)))
+
     async def record_stream(
         self,
         stream_info: StreamInfo,
@@ -484,8 +488,8 @@ class StreamRecorder:
 
                 # AGGRESSIVE retry settings for stream interruptions/lags
                 cmd.extend([
-                    '--retries', 'infinite',  # Keep retrying forever
-                    '--fragment-retries', 'infinite',  # Never give up on fragments
+                    '--retries', self._retry_value(self.retries),
+                    '--fragment-retries', self._retry_value(self.fragment_retries),
                     '--extractor-retries', '30',  # More extractor retries
                     '--retry-sleep', 'exp=1:300',  # Exponential backoff up to 5 minutes
                     '--retry-sleep', 'fragment:exp=1:120',  # Fragment retry up to 2 minutes

@@ -6,10 +6,11 @@ Uploads video files to Telegram channel using Telethon.
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 from telethon import TelegramClient
 from telethon.tl.types import User
@@ -106,6 +107,7 @@ class TelegramUploader:
         self._throttle_started_at: float = time.monotonic()
         self._throttle_sent_bytes: int = 0
         self._throttle_lock = asyncio.Lock()
+        self._runtime_lock = asyncio.Lock()
         # FastTelethonhelper bypasses Telethon progress callback; disable it when throttling is requested.
         self._fast_upload_enabled: bool = (
             FAST_UPLOAD_AVAILABLE and self.use_fast_upload_helper and not self._throttle_enabled
@@ -167,6 +169,11 @@ class TelegramUploader:
             self._client = None
     
     @property
+    def client(self) -> Optional[TelegramClient]:
+        """Expose the connected Telethon client for control-plane handlers."""
+        return self._client
+
+    @property
     def is_premium(self) -> bool:
         """Check if connected account has Premium status."""
         return self._is_premium
@@ -225,6 +232,45 @@ class TelegramUploader:
                 progress_callback(current, total)
 
         return _progress
+
+    def apply_upload_runtime(self, upload_parallelism: int, upload_speed_limit_mbps: float) -> None:
+        """Apply mutable upload limits for subsequent Telegram uploads."""
+        self.upload_parallelism = max(1, int(upload_parallelism or 1))
+        self.upload_speed_limit_mbps = max(0.0, float(upload_speed_limit_mbps or 0.0))
+        self._upload_speed_limit_bps = self.upload_speed_limit_mbps * 1_000_000 / 8
+        self._throttle_enabled = self._upload_speed_limit_bps > 0
+        self._throttle_started_at = time.monotonic()
+        self._throttle_sent_bytes = 0
+        self._fast_upload_enabled = (
+            FAST_UPLOAD_AVAILABLE and self.use_fast_upload_helper and not self._throttle_enabled
+        )
+
+    @asynccontextmanager
+    async def upload_runtime(self, upload_parallelism: int, upload_speed_limit_mbps: float):
+        """Serialize temporary upload runtime changes for one upload pipeline."""
+        async with self._runtime_lock:
+            previous = (
+                self.upload_parallelism,
+                self.upload_speed_limit_mbps,
+                self._upload_speed_limit_bps,
+                self._throttle_enabled,
+                self._throttle_started_at,
+                self._throttle_sent_bytes,
+                self._fast_upload_enabled,
+            )
+            self.apply_upload_runtime(upload_parallelism, upload_speed_limit_mbps)
+            try:
+                yield
+            finally:
+                (
+                    self.upload_parallelism,
+                    self.upload_speed_limit_mbps,
+                    self._upload_speed_limit_bps,
+                    self._throttle_enabled,
+                    self._throttle_started_at,
+                    self._throttle_sent_bytes,
+                    self._fast_upload_enabled,
+                ) = previous
     
     def _format_caption(
         self,
@@ -349,7 +395,8 @@ class TelegramUploader:
         file_path: str,
         caption: str,
         progress_callback: Optional[Callable[[float], None]] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        target_channel_id: Optional[int] = None
     ) -> UploadResult:
         """
         Upload a single file to the channel.
@@ -425,7 +472,7 @@ class TelegramUploader:
                             progress_bar_function=None
                         )
                         message = await self._client.send_file(
-                            self.channel_id,
+                            target_channel_id or self.channel_id,
                             uploaded_file,
                             caption=caption,
                             supports_streaming=True,
@@ -434,7 +481,7 @@ class TelegramUploader:
                         )
                     else:
                         message = await self._client.send_file(
-                            self.channel_id,
+                            target_channel_id or self.channel_id,
                             file_path,
                             caption=caption,
                             progress_callback=self._make_rate_limited_progress(progress),
@@ -474,7 +521,13 @@ class TelegramUploader:
         self,
         stream_info: StreamInfo,
         file_paths: List[str],
-        duration_str: str = ""
+        duration_str: str = "",
+        part_uploaded_callback: Optional[Callable[[UploadResult], Awaitable[None]]] = None,
+        target_channel_id: Optional[int] = None,
+        start_part_num: int = 1,
+        total_parts_override: Optional[int] = None,
+        album_index_offset: int = 0,
+        album_total_override: Optional[int] = None,
     ) -> BatchUploadResult:
         """
         Upload multiple parts of a stream recording as albums.
@@ -483,16 +536,22 @@ class TelegramUploader:
             stream_info: Information about the stream.
             file_paths: List of file paths to upload.
             duration_str: Total stream duration string.
+            part_uploaded_callback: Called after each channel message is created.
             
         Returns:
             BatchUploadResult with individual results.
         """
-        total_parts = len(file_paths)
+        total_parts = total_parts_override or len(file_paths)
+        pending_parts = len(file_paths)
         
         self._logger.info(
-            f"Uploading {total_parts} parts for {stream_info.channel}"
+            f"Uploading {pending_parts}/{total_parts} parts for {stream_info.channel}"
         )
         
+        async def notify_uploaded(result: UploadResult) -> None:
+            if result.success and result.message_id and part_uploaded_callback:
+                await part_uploaded_callback(result)
+
         # If single file, use regular upload
         if total_parts == 1:
             path = Path(file_paths[0])
@@ -502,11 +561,12 @@ class TelegramUploader:
                 file_size_mb=file_size_mb,
                 duration_str=duration_str
             )
-            result = await self.upload_file(file_paths[0], caption)
+            result = await self.upload_file(file_paths[0], caption, target_channel_id=target_channel_id)
+            await notify_uploaded(result)
             return BatchUploadResult(
                 channel=stream_info.channel,
                 stream_info=stream_info,
-                total_parts=1,
+                total_parts=total_parts,
                 successful_uploads=1 if result.success else 0,
                 failed_uploads=0 if result.success else 1,
                 results=[result]
@@ -514,14 +574,14 @@ class TelegramUploader:
         
         # Split into chunks of 10 (Telegram album limit)
         chunks = [file_paths[i:i+10] for i in range(0, len(file_paths), 10)]
-        album_total = len(chunks)
+        album_total = album_total_override or len(chunks)
         
         self._logger.info(f"Sending as {len(chunks)} album(s)")
         
         # Upload albums sequentially to preserve order
         all_results: List[UploadResult] = []
         for chunk_idx, chunk in enumerate(chunks):
-            start_part = chunk_idx * 10 + 1
+            start_part = start_part_num + chunk_idx * 10
             try:
                 result = await self._upload_album(
                     stream_info=stream_info,
@@ -529,8 +589,9 @@ class TelegramUploader:
                     start_part_num=start_part,
                     total_parts=total_parts,
                     duration_str=duration_str if chunk_idx == 0 else "",
-                    album_index=chunk_idx + 1,
-                    album_total=album_total
+                    album_index=album_index_offset + chunk_idx + 1,
+                    album_total=album_total,
+                    target_channel_id=target_channel_id
                 )
             except Exception as e:
                 self._logger.error(f"Album upload error: {e}")
@@ -538,9 +599,11 @@ class TelegramUploader:
             
             if isinstance(result, list):
                 all_results.extend(result)
+                for upload_result in result:
+                    await notify_uploaded(upload_result)
         
         successful = sum(1 for r in all_results if r.success)
-        failed = total_parts - successful
+        failed = pending_parts - successful
         
         self._logger.info(
             f"Upload complete: {successful}/{total_parts} successful"
@@ -565,7 +628,8 @@ class TelegramUploader:
         album_index: int = 1,
         album_total: int = 1,
         compressed_note: str = "",
-        max_retries: int = 5
+        max_retries: int = 5,
+        target_channel_id: Optional[int] = None
     ) -> List[UploadResult]:
         """
         Upload files as a single album (max 10 files) with retry logic.
@@ -729,7 +793,7 @@ class TelegramUploader:
                 self._logger.info(f"Sending album with {len(media_list)} files...")
                 
                 messages = await self._client.send_file(
-                    self.channel_id,
+                    target_channel_id or self.channel_id,
                     media_list,
                     caption=captions
                 )
@@ -815,7 +879,7 @@ class TelegramUploader:
         # Should not reach here, but just in case
         return [UploadResult(f, None, False, "Max retries exceeded") for f in file_paths]
     
-    async def send_text_message(self, text: str) -> Optional[int]:
+    async def send_text_message(self, text: str, target_channel_id: Optional[int] = None) -> Optional[int]:
         """
         Send a text message to the channel.
         
@@ -830,7 +894,7 @@ class TelegramUploader:
         
         try:
             message = await self._client.send_message(
-                self.channel_id,
+                target_channel_id or self.channel_id,
                 text
             )
             return message.id
@@ -842,7 +906,8 @@ class TelegramUploader:
         self,
         channel: str,
         title: str,
-        category: str
+        category: str,
+        target_channel_id: Optional[int] = None
     ) -> Optional[int]:
         """
         Send "waiting for stream" message.
@@ -861,14 +926,15 @@ class TelegramUploader:
             f"Название: **{title}**\n"
             f"Категория: **{category}**"
         )
-        return await self.send_text_message(text)
+        return await self.send_text_message(text, target_channel_id=target_channel_id)
     
     async def update_waiting_message(
         self,
         message_id: int,
         channel: str,
         title: str,
-        category: str
+        category: str,
+        target_channel_id: Optional[int] = None
     ) -> bool:
         """Update waiting message with new info."""
         if not self._client:
@@ -883,7 +949,7 @@ class TelegramUploader:
         
         try:
             await self._client.edit_message(
-                self.channel_id,
+                target_channel_id or self.channel_id,
                 message_id,
                 text
             )
@@ -897,7 +963,8 @@ class TelegramUploader:
         channel: str,
         title: str,
         category: str,
-        status: str = "🔴 Запись"
+        status: str = "🔴 Запись",
+        target_channel_id: Optional[int] = None
     ) -> Optional[int]:
         """
         Send status message during recording.
@@ -917,7 +984,7 @@ class TelegramUploader:
             f"Категория: **{category}**\n\n"
             f"Статус: **{status}**"
         )
-        return await self.send_text_message(text)
+        return await self.send_text_message(text, target_channel_id=target_channel_id)
     
     async def update_status(
         self,
@@ -925,7 +992,8 @@ class TelegramUploader:
         channel: str,
         title: str,
         category: str,
-        status: str
+        status: str,
+        target_channel_id: Optional[int] = None
     ) -> bool:
         """Update status message."""
         if not self._client:
@@ -940,7 +1008,7 @@ class TelegramUploader:
         
         try:
             await self._client.edit_message(
-                self.channel_id,
+                target_channel_id or self.channel_id,
                 message_id,
                 text
             )
@@ -949,14 +1017,14 @@ class TelegramUploader:
             self._logger.warning(f"Failed to update status: {e}")
             return False
     
-    async def delete_message(self, message_id: int) -> bool:
+    async def delete_message(self, message_id: int, target_channel_id: Optional[int] = None) -> bool:
         """Delete a message by ID."""
         if not self._client:
             return False
         
         try:
             await self._client.delete_messages(
-                self.channel_id,
+                target_channel_id or self.channel_id,
                 message_id
             )
             return True
@@ -997,14 +1065,19 @@ class TelegramUploader:
         
         return caption
 
-    async def update_message_caption(self, message_id: int, text: str) -> bool:
+    async def update_message_caption(
+        self,
+        message_id: int,
+        text: str,
+        target_channel_id: Optional[int] = None
+    ) -> bool:
         """Update caption/text for a message."""
         if not self._client:
             return False
         
         try:
             await self._client.edit_message(
-                self.channel_id,
+                target_channel_id or self.channel_id,
                 message_id,
                 text
             )
@@ -1013,7 +1086,12 @@ class TelegramUploader:
             self._logger.warning(f"Failed to update message caption: {e}")
             return False
     
-    async def forward_to_backup(self, message_ids: List[int]) -> List[int]:
+    async def forward_to_backup(
+        self,
+        message_ids: List[int],
+        source_channel_id: Optional[int] = None,
+        backup_channel_id: Optional[int] = None
+    ) -> List[int]:
         """
         Forward messages to backup channel.
         
@@ -1023,7 +1101,9 @@ class TelegramUploader:
         Returns:
             List of forwarded message IDs.
         """
-        if not self._client or not self.backup_channel_id:
+        backup_target = backup_channel_id if backup_channel_id is not None else self.backup_channel_id
+        source_target = source_channel_id or self.channel_id
+        if not self._client or not backup_target:
             return []
         
         forwarded = []
@@ -1031,9 +1111,9 @@ class TelegramUploader:
         try:
             for msg_id in message_ids:
                 result = await self._client.forward_messages(
-                    self.backup_channel_id,
+                    backup_target,
                     msg_id,
-                    self.channel_id
+                    source_target
                 )
                 if result:
                     forwarded.append(result.id)
@@ -1050,7 +1130,9 @@ class TelegramUploader:
         self,
         reply_to_msg_id: int,
         file_path: str,
-        caption: str = ""
+        caption: str = "",
+        target_channel_id: Optional[int] = None,
+        discussion_group_id: Optional[int] = None
     ) -> Optional[int]:
         """
         Send file to discussion/comments of a post.
@@ -1118,23 +1200,24 @@ class TelegramUploader:
                     
                     # Preferred mode: comment to channel post.
                     message = await send_to_target(
-                        target_id=self.channel_id,
+                        target_id=target_channel_id or self.channel_id,
                         use_comment_to=True,
                         send_caption=base_caption
                     )
                 except Exception as primary_error:
                     # Optional fallback: send to explicit discussion group if configured.
-                    if not self.discussion_group_id:
+                    fallback_discussion_id = discussion_group_id if discussion_group_id is not None else self.discussion_group_id
+                    if not fallback_discussion_id:
                         raise primary_error
                     self._logger.warning(
-                        f"Comment send failed, falling back to discussion group {self.discussion_group_id}: {primary_error}"
+                        f"Comment send failed, falling back to discussion group {fallback_discussion_id}: {primary_error}"
                     )
                     fallback_caption = (
                         f"{caption or '📦 Сжатая версия'}\n\n"
                         f"(исходный пост: {reply_to_msg_id})"
                     )
                     message = await send_to_target(
-                        target_id=self.discussion_group_id,
+                        target_id=fallback_discussion_id,
                         use_comment_to=False,
                         send_caption=fallback_caption
                     )

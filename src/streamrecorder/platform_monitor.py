@@ -8,6 +8,7 @@ from typing import AsyncIterator, List, Optional
 
 from .config import Config
 from .logger import get_logger
+from .runtime_config import RuntimeConfigSnapshot
 from .stream_monitor import StreamMonitor, MonitorEvent, StreamInfo
 from .youtube_monitor import YouTubeMonitor
 from .twitch_api import TwitchAPI
@@ -55,7 +56,8 @@ class PlatformMonitor:
             if config.youtube.channels:
                 self._youtube_monitor = YouTubeMonitor(
                     channels=config.youtube.channels,
-                    check_interval=config.youtube.check_interval
+                    check_interval=config.youtube.check_interval,
+                    cookies_file=config.recording.cookies_file
                 )
                 self._logger.info(f"YouTube monitor: {len(config.youtube.channels)} channels")
             elif platform in ("youtube", "cross"):
@@ -64,6 +66,59 @@ class PlatformMonitor:
         # Cross mode: don't start Twitch monitor, but keep API for manual checks
         if platform == "cross":
             self._logger.info(f"Cross mode: YouTube monitors first, Twitch checked after YT stream ends")
+
+    def apply_runtime_snapshot(self, snapshot: RuntimeConfigSnapshot) -> None:
+        """Apply enabled runtime sources to live monitors."""
+        twitch_channels = [
+            source.handle
+            for source in snapshot.sources.values()
+            if source.enabled and source.platform == "twitch"
+        ]
+        youtube_channels = [
+            source.handle
+            for source in snapshot.sources.values()
+            if source.enabled and source.platform == "youtube"
+        ]
+
+        self._config.twitch.channels = twitch_channels
+        self._config.youtube.channels = youtube_channels
+
+        if self._config.platform in ("twitch", "both"):
+            if twitch_channels and self._twitch_api:
+                if self._twitch_monitor:
+                    self._twitch_monitor.update_channels(twitch_channels)
+                else:
+                    self._twitch_monitor = StreamMonitor(
+                        twitch_api=self._twitch_api,
+                        channels=twitch_channels,
+                        check_interval=self._config.twitch.check_interval,
+                        offline_grace_period=self._config.twitch.offline_grace_period,
+                    )
+                    if self._running:
+                        self._twitch_monitor.start()
+            elif self._twitch_monitor:
+                self._twitch_monitor.update_channels([])
+
+        if self._config.platform in ("youtube", "both", "cross"):
+            if youtube_channels:
+                if self._youtube_monitor:
+                    self._youtube_monitor.update_channels(youtube_channels)
+                else:
+                    self._youtube_monitor = YouTubeMonitor(
+                        channels=youtube_channels,
+                        check_interval=self._config.youtube.check_interval,
+                        cookies_file=self._config.recording.cookies_file,
+                    )
+                    if self._running:
+                        self._youtube_monitor.start()
+            elif self._youtube_monitor:
+                self._youtube_monitor.update_channels([])
+
+        self._logger.info(
+            "Runtime monitor snapshot applied: %d Twitch, %d YouTube sources",
+            len(twitch_channels),
+            len(youtube_channels),
+        )
 
     def start(self) -> None:
         """Start all monitors."""
@@ -162,23 +217,10 @@ class PlatformMonitor:
         if not self._running:
             self.start()
 
-        # Create tasks for each monitor
-        tasks = []
-
-        if self._twitch_monitor:
-            tasks.append(self._run_twitch_monitor())
-
-        if self._youtube_monitor:
-            tasks.append(self._run_youtube_monitor())
-
-        if not tasks:
-            self._logger.error("No monitors configured!")
-            return
-
         # Use asyncio.Queue to merge events from multiple monitors
         event_queue: asyncio.Queue[MonitorEvent] = asyncio.Queue()
 
-        async def feed_queue(monitor_coro):
+        async def feed_queue(name: str, monitor_coro):
             """Feed events from a monitor into the queue."""
             try:
                 async for event in monitor_coro:
@@ -187,22 +229,27 @@ class PlatformMonitor:
                 pass
             except Exception as e:
                 self._logger.error(f"Monitor error: {e}")
+            finally:
+                active_monitors.discard(name)
 
-        # Start monitor tasks
         monitor_tasks = []
+        active_monitors = set()
 
-        if self._twitch_monitor:
-            monitor_tasks.append(
-                asyncio.create_task(feed_queue(self._twitch_monitor.monitor()))
-            )
+        def ensure_monitor_tasks() -> None:
+            if self._twitch_monitor and "twitch" not in active_monitors:
+                monitor_tasks.append(asyncio.create_task(feed_queue("twitch", self._twitch_monitor.monitor())))
+                active_monitors.add("twitch")
+            if self._youtube_monitor and "youtube" not in active_monitors:
+                monitor_tasks.append(asyncio.create_task(feed_queue("youtube", self._youtube_monitor.monitor())))
+                active_monitors.add("youtube")
 
-        if self._youtube_monitor:
-            monitor_tasks.append(
-                asyncio.create_task(feed_queue(self._youtube_monitor.monitor()))
-            )
+        ensure_monitor_tasks()
+        if not monitor_tasks:
+            self._logger.warning("No monitors configured yet; waiting for runtime sources")
 
         try:
             while self._running:
+                ensure_monitor_tasks()
                 try:
                     # Wait for events with timeout to check running flag
                     event = await asyncio.wait_for(event_queue.get(), timeout=1.0)

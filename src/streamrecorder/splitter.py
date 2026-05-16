@@ -113,12 +113,109 @@ class FileSplitter:
         Returns:
             True if file exceeds max size.
         """
+        max_size_gb = self._validate_max_size_gb(max_size_gb)
         path = Path(file_path)
         if not path.exists():
             return False
 
         size_gb = path.stat().st_size / (1024 * 1024 * 1024)
         return size_gb > max_size_gb
+
+    def _validate_max_size_gb(self, max_size_gb: float) -> float:
+        """Normalize and validate split size limit."""
+        try:
+            value = float(max_size_gb)
+        except (TypeError, ValueError):
+            raise ValueError(f"max_size_gb must be a positive number, got {max_size_gb!r}") from None
+        if value <= 0:
+            raise ValueError(f"max_size_gb must be > 0, got {max_size_gb!r}")
+        return value
+
+    async def _split_with_reencode_fallback(
+        self,
+        input_file: Path,
+        output_dir: Path,
+        prefix: str,
+        max_size_bytes: float,
+        segment_time: int,
+        file_size: int
+    ) -> SplitResult:
+        """Fallback split that forces keyframes when stream-copy segments stay oversized."""
+        output_pattern = str(output_dir / f"{prefix}_part%03d.mp4")
+        current_segment_time = max(1, int(segment_time))
+        last_error = ""
+
+        for attempt in range(1, 5):
+            for stale_part in output_dir.glob(f"{prefix}_part*.mp4"):
+                try:
+                    stale_part.unlink()
+                except Exception:
+                    pass
+
+            self._logger.warning(
+                "Retrying split with forced keyframes/re-encode "
+                f"(attempt {attempt}, segment_time={current_segment_time}s)"
+            )
+            process = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-y',
+                '-i', str(input_file),
+                '-map', '0',
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-crf', '20',
+                '-force_key_frames', f"expr:gte(t,n_forced*{current_segment_time})",
+                '-c:a', 'copy',
+                '-f', 'segment',
+                '-segment_time', str(current_segment_time),
+                '-reset_timestamps', '1',
+                '-movflags', '+faststart',
+                output_pattern,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                last_error = stderr.decode('utf-8', errors='ignore')[-1000:]
+                self._logger.error(f"ffmpeg fallback split failed: {last_error}")
+                break
+
+            output_files = sorted(output_dir.glob(f"{prefix}_part*.mp4"))
+            oversized = [f for f in output_files if f.stat().st_size > max_size_bytes]
+            if output_files and not oversized:
+                output_paths = [str(f) for f in output_files]
+                self._logger.info(f"Fallback split into {len(output_paths)} parts")
+                return SplitResult(
+                    input_file=str(input_file),
+                    output_files=output_paths,
+                    total_size_bytes=file_size,
+                    part_count=len(output_paths),
+                    success=True
+                )
+
+            largest = max(oversized, key=lambda f: f.stat().st_size) if oversized else None
+            last_error = "fallback split produced oversized part"
+            if largest:
+                last_error = (
+                    f"fallback split produced oversized part {largest.name} "
+                    f"({largest.stat().st_size / (1024 * 1024 * 1024):.2f}GB)"
+                )
+            current_segment_time = max(1, int(current_segment_time * 0.75))
+
+        for stale_part in output_dir.glob(f"{prefix}_part*.mp4"):
+            try:
+                stale_part.unlink()
+            except Exception:
+                pass
+
+        return SplitResult(
+            input_file=str(input_file),
+            output_files=[],
+            total_size_bytes=file_size,
+            part_count=0,
+            success=False,
+            error=last_error or "Fallback split failed"
+        )
 
     async def split_file(
         self,
@@ -140,6 +237,7 @@ class FileSplitter:
             SplitResult with list of output files.
         """
         input_file = Path(input_path)
+        max_size_gb = self._validate_max_size_gb(max_size_gb)
 
         if not input_file.exists():
             return SplitResult(
@@ -284,6 +382,17 @@ class FileSplitter:
                 )
                 current_segment_time = max(1, int(current_segment_time * 0.85))
 
+            fallback_result = await self._split_with_reencode_fallback(
+                input_file=input_file,
+                output_dir=output_dir,
+                prefix=prefix,
+                max_size_bytes=max_size_bytes,
+                segment_time=current_segment_time,
+                file_size=file_size
+            )
+            if fallback_result.success:
+                return fallback_result
+
             for stale_part in output_dir.glob(f"{prefix}_part*.mp4"):
                 try:
                     stale_part.unlink()
@@ -296,7 +405,7 @@ class FileSplitter:
                 total_size_bytes=file_size,
                 part_count=0,
                 success=False,
-                error=last_error or "Split size validation failed"
+                error=fallback_result.error or last_error or "Split size validation failed"
             )
         except Exception as e:
             self._logger.error(f"Split error: {e}")
